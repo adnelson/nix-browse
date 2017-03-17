@@ -1,8 +1,10 @@
 extern crate regex;
 extern crate unescape;
 
+use std::collections::HashMap;
+use std::iter::{Peekable, FromIterator};
 use std::slice;
-use std::iter::Peekable;
+
 use regex::{Regex, CaptureMatches};
 
 lazy_static! {
@@ -20,7 +22,7 @@ pub static ref NIX_INSTANTIATE_OUTPUT_RE: Regex = Regex::new(r#"(?x)
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 enum Token {
-    Null, Bool(bool), String(String), CODE, LAMBDA, PRIMOP, Eq, Semi,
+    Null, Bool(bool), String(String), CODE, LAMBDA, PRIMOP, Equals, Semi,
     Number(i64), LParens, RParens, LBracket, RBracket, LCurly, RCurly,
     Ident(String),
 }
@@ -40,7 +42,7 @@ fn token_from_str(token_str: &str) -> Token {
         "(" => LParens, ")" => RParens,
         "[" => LBracket, "]" => RBracket,
         "{" => LCurly, "}" => RCurly,
-        "=" => Eq, ";" => Semi,
+        "=" => Equals, ";" => Semi,
         s if s.starts_with("\"") =>
             // Trim off the quotes, unescape and panic if it fails
             String(unescape::unescape(&s[1..s.len() - 1]).unwrap()),
@@ -103,8 +105,8 @@ pub enum Value {
     /// Lists of nix values.
     List(Vec<Value>),
 
-    // Mappings from
-    // Set(HashMap<String, Value>),
+    /// Mappings from.
+    Map(HashMap<String, Value>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,24 +114,23 @@ enum ParseError {
     UnexpectedEndOfInput,
     UnexpectedToken(Token),
     UnterminatedList,
+    UnterminatedMap,
 }
 
 /// Parse a stream of nix output tokens into a nix value. Consumes one or more
 /// values from the stream.
-fn parse_tokens(tokens: &mut Tokens)
+fn parse_value(tokens: &mut Tokens)
    -> Result<Value, ParseError> {
     use self::ParseError::*;
-    let tok = tokens.next();
-    println!("Token: {:?}", tok);
-    match tok {
+    match tokens.next() {
         Some(Token::Null) => Ok(Value::Null),
         Some(Token::Bool(b)) => Ok(Value::Bool(b)),
         Some(Token::Number(n)) => Ok(Value::Number(n)),
         Some(Token::String(s)) => Ok(Value::String(s)),
         Some(Token::CODE) => Ok(Value::Unevaluated),
         Some(Token::LAMBDA) | Some(Token::PRIMOP) => Ok(Value::Function),
-        Some(Token::LBracket) =>
-            parse_list(tokens),
+        Some(Token::LBracket) => parse_list(tokens),
+        Some(Token::LCurly) => parse_set(tokens),
         Some(t) => Err(UnexpectedToken(t)),
         None => Err(UnexpectedEndOfInput),
     }
@@ -138,33 +139,70 @@ fn parse_tokens(tokens: &mut Tokens)
 /// Parse a nix list, e.g. [1 2 3].
 fn parse_list(tokens: &mut Tokens)
    -> Result<Value, ParseError> {
-    use self::ParseError::*;
     let mut values = vec!();
     loop {
         match tokens.peek() {
             Some(Token::RBracket) => {
-                println!("terminating the list");
                 // Consume the bracket.
                 tokens.next();
-                println!("ok");
                 // Exit the loop wrapping the vector in a list constructor.
                 return Ok(Value::List(values));
             },
-            Some(_) => {println!("turds"); match parse_tokens(tokens) {
+            Some(_) => match parse_value(tokens) {
                 Ok(value) => values.push(value),
                 err => return err
-            }},
-            _ => return Err(UnterminatedList),
+            },
+            _ => return Err(ParseError::UnterminatedList),
         }
     }
 
+}
+
+/// Parse a nix attribute set, e.g. {x = 1;}.
+fn parse_set(tokens: &mut Tokens) -> Result<Value, ParseError> {
+    let mut map: HashMap<String, Value> = HashMap::new();
+    loop {
+        // If the next token is a curly brace, consume it and return.
+        if let Some(Token::RCurly) = tokens.peek() {
+            tokens.next();
+            return Ok(Value::Map(map));
+        }
+        // It's not a curly brace, so first we need an identifier.
+        let ident = parse_ident(tokens)?;
+        // Next we need an equals sign
+        let _ = parse_token(tokens, Token::Equals)?;
+        // Then we need some nix value
+        let val = parse_value(tokens)?;
+        // Finally we need a semicolon
+        let _ = parse_token(tokens, Token::Semi)?;
+        // Now we can put the key/value into our map
+        map.insert(ident, val);
+    }
+}
+
+/// Parse a nix identifier
+fn parse_ident(tokens: &mut Tokens) -> Result<String, ParseError> {
+    match tokens.next() {
+        Some(Token::Ident(ident)) => Ok(ident),
+        Some(token) => Err(ParseError::UnexpectedToken(token)),
+        None => Err(ParseError::UnexpectedEndOfInput),
+    }
+}
+
+/// Parse an exact token
+fn parse_token(tokens: &mut Tokens, token: Token) -> Result<(), ParseError> {
+    match tokens.next() {
+        Some(token_) => if token_ == token { Ok(()) }
+                        else { Err(ParseError::UnexpectedToken(token)) },
+        None => Err(ParseError::UnexpectedEndOfInput),
+    }
 }
 
 fn parse_nix_instantiate(output: &str) -> Result<Value, ParseError> {
     let mut tokens = Tokens {
         iter: NIX_INSTANTIATE_OUTPUT_RE.captures_iter(output).peekable()
     };
-    parse_tokens(&mut tokens)
+    parse_value(&mut tokens)
 }
 
 #[test]
@@ -201,7 +239,10 @@ fn test_parse_list() {
     let expected = Ok(List(vec!(Number(1), Number(2), Number(3))));
     debug_assert!(res == expected, "expected {:?}, but got {:?}",
                   expected, res);
-
+    let res = parse_nix_instantiate("[1 <CODE> 4]");
+    let expected = Ok(List(vec!(Number(1), Unevaluated, Number(4))));
+    debug_assert!(res == expected, "expected {:?}, but got {:?}",
+                  expected, res);
 }
 
 #[test]
@@ -212,37 +253,35 @@ fn test_parse_nested_list() {
                                 List(vec!(Number(3), Number(4))))));
     debug_assert!(res == expected, "expected {:?}, but got {:?}",
                   expected, res);
-
 }
 
+#[test]
+fn test_parse_set() {
+   use self::Value::*;
+    let res = parse_nix_instantiate("{x = 1; y = 2;}");
+    let map = HashMap::from_iter(vec!(("x".to_string(), Number(1)),
+                                      ("y".to_string(), Number(2))));
+    let expected = Ok(Map(map));
+    // let expected = Ok(List(vec!(Number(1), Number(2),
+    //                             List(vec!(Number(3), Number(4))))));
+    debug_assert!(res == expected, "expected {:?}, but got {:?}",
+                  expected, res);
+}
 
-// fn parse_nix_instantiate(iterator: ) -> Result<String, Value> {
-//     let mut result = Err("Nothing parsed".to_string());
-//     for tok in NIX_INSTANTIATE_OUTPUT_RE.captures_iter(text) {
-//         match token_from_str(tok) {
-//             Null , Bool(bool), String(String), CODE, LAMBDA, PRIMOP, Eq, Semi,
-//     Number(i64), LParens, RParens, LBracket, RBracket, LCurly, RCurly,
-//     Ident(String),
-
-//         }
-//     }
-// }
-
-
-// /// Remove the escape sequences from a string. For example, translate
-// /// \n into a newline, \" into a quote, etc.
-// fn unescape_string(string: &str) -> Result<String, String> {
-//     let mut result = String::new();
-//     let mut in_escape = false;
-//     for c in string.chars() {
-//         if in_escape {
-//             match c {
-//                 '\\' => result.push('\\')
-//                 'n' => result.push('\n')
-//         unimplemented!()
-//     }
-//     unimplemented!()
-// }
+#[test]
+fn test_nested_set() {
+   use self::Value::*;
+    let res = parse_nix_instantiate("{x = 1; y = {z = 2;};}");
+    let map = HashMap::from_iter(vec!(
+        ("x".to_string(), Number(1)),
+        ("y".to_string(),
+          Map(HashMap::from_iter(vec!(("z".to_string(), Number(2))))))));
+    let expected = Ok(Map(map));
+    // let expected = Ok(List(vec!(Number(1), Number(2),
+    //                             List(vec!(Number(3), Number(4))))));
+    debug_assert!(res == expected, "expected {:?}, but got {:?}",
+                  expected, res);
+}
 
 #[test]
 fn test_token_from_str() {
