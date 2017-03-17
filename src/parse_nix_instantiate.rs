@@ -3,6 +3,8 @@ extern crate unescape;
 
 use std::collections::HashMap;
 use std::iter::{Peekable, FromIterator};
+use std::path::PathBuf;
+use std::process::Command;
 use std::slice;
 
 use regex::{Regex, CaptureMatches};
@@ -204,6 +206,26 @@ fn parse_nix_instantiate(output: &str) -> Result<Value, ParseError> {
     };
     parse_value(&mut tokens)
 }
+
+/// Given a path to a nix file and a possible attribute off of that
+/// file, evaluate the attribute.
+fn exec_nix_instantiate(filepath: &PathBuf, attr: Option<String>)
+       -> Result<Value, ParseError> {
+    let s = filepath.as_path().as_os_str();
+    let mut cmd = Command::new("nix-instantiate");
+    cmd.arg("--eval").arg(s);
+    match attr {
+        None => {},
+        Some(attr) => {cmd.arg(attr);}
+    }
+    let output = cmd.output().expect("failed to start nix-instantiate");
+    let lines = String::from_utf8_lossy(&output.stdout);
+    println!("Got lines:\n{}", lines);
+    unimplemented!();
+// filepath.as_os_str());
+//                      .args(&["-A", attr.as_slice()]);
+}
+
 
 #[test]
 fn test_parse_literals() {
