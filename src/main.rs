@@ -16,13 +16,6 @@ use regex::Regex;
 pub mod parse_nix_instantiate;
 use parse_nix_instantiate::exec_nix_instantiate;
 
-// const USAGE: &'static str = "
-// Evaluate a nix expression.
-
-// Usage:
-//   nix-eval
-// ";
-
 fn main() {
     let cwd = current_dir().unwrap();
     let matches = App::new("eval-nix")
@@ -34,7 +27,6 @@ fn main() {
              .long("arg")
              .number_of_values(2)
              .multiple(true))
-        // .arg(Arg::from_usage("[ATTRIBUTE] -A, --attr 'Attribute in the file to eval'"))
 	.get_matches();
 
     let path = PathBuf::from(matches.value_of("PATH").unwrap());
@@ -61,6 +53,5 @@ fn main() {
         },
     }
     let evald = exec_nix_instantiate(&path, attribute, &expr_args);
-    // println!("{:?}", evald);
     println!("{}", serde_json::to_string(&evald).unwrap());
 }

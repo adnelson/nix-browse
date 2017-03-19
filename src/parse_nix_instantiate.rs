@@ -7,17 +7,9 @@ use std::iter::{Peekable, FromIterator};
 use std::path::PathBuf;
 use std::process::Command;
 use std::slice;
+use std::convert::From;
 
 use regex::{Regex, CaptureMatches};
-//use serde::
-//use serde::ser; // Serialize; // , Serializer};
-
-// #[derive(Serialize, Deserialize, Debug)]
-// struct Point {
-//     x: i32,
-//     y: i32,
-// }
-
 
 lazy_static! {
 pub static ref NIX_INSTANTIATE_OUTPUT_RE: Regex = Regex::new(r#"(?x)
@@ -33,36 +25,38 @@ pub static ref NIX_INSTANTIATE_OUTPUT_RE: Regex = Regex::new(r#"(?x)
 /// When parsing the output of nix-instantiate, we'll tokenize into a
 /// vector of tokens; this type represents these.
 #[derive(Debug, PartialEq, Serialize)]
-#[allow(dead_code)]
 pub enum Token {
     Null, Bool(bool), String(String), CODE, LAMBDA, PRIMOP, CYCLE, Equals,
     Semi, Number(i64), LParens, RParens, LBracket, RBracket, LCurly, RCurly,
     Path(PathBuf), Ident(String),
 }
 
-fn token_from_str(token_str: &str) -> Token {
-    lazy_static! {
-        static ref int_re: Regex = Regex::new(r"^-?\d+$").unwrap();
-    }
-    use self::Token::*;
-    match token_str {
-        "null" => Null,
-        "true" => Bool(true),
-        "false" => Bool(false),
-        "<CODE>" => CODE,
-        "<CYCLE>" => CYCLE,
-        "<LAMBDA>" => LAMBDA,
-        "<PRIMOP>" => PRIMOP,
-        "(" => LParens, ")" => RParens,
-        "[" => LBracket, "]" => RBracket,
-        "{" => LCurly, "}" => RCurly,
-        "=" => Equals, ";" => Semi,
-        s if s.starts_with("\"") =>
-            // Trim off the quotes, unescape and panic if it fails
-            String(unescape::unescape(&s[1..s.len() - 1]).unwrap()),
-        s if int_re.is_match(s) => Number(s.parse().unwrap()),
-        s if s.starts_with("/") => Path(PathBuf::from(s)),
-        _ => Ident(token_str.to_string()),
+/// Strings can be converted into tokens
+impl<'a> From<&'a str> for Token {
+    fn from(token_str: &'a str) -> Token {
+        lazy_static! {
+            static ref int_re: Regex = Regex::new(r"^-?\d+$").unwrap();
+        }
+        use self::Token::*;
+        match token_str {
+            "null" => Null,
+            "true" => Bool(true),
+            "false" => Bool(false),
+            "<CODE>" => CODE,
+            "<CYCLE>" => CYCLE,
+            "<LAMBDA>" => LAMBDA,
+            "<PRIMOP>" => PRIMOP,
+            "(" => LParens, ")" => RParens,
+            "[" => LBracket, "]" => RBracket,
+            "{" => LCurly, "}" => RCurly,
+            "=" => Equals, ";" => Semi,
+            s if s.starts_with("\"") =>
+                // Trim off the quotes, unescape and panic if it fails
+                String(unescape::unescape(&s[1..s.len() - 1]).unwrap()),
+            s if int_re.is_match(s) => Number(s.parse().unwrap()),
+            s if s.starts_with("/") => Path(PathBuf::from(s)),
+            _ => Ident(token_str.to_string()),
+        }
     }
 }
 
@@ -72,15 +66,20 @@ struct Tokens<'a> {
 }
 
 impl<'a> Tokens<'a> {
+    /// It's necessary to be able to look at the next token (if there
+    /// is one) without consuming it.
     fn peek(&mut self) -> Option<Token> {
-        self.iter.peek().map(|t| token_from_str(&t[0]))
+        self.iter.peek().map(|t| Token::from(&t[0]))
     }
 }
 
 impl<'a> Iterator for Tokens<'a> {
+    /// Token streams yield tokens.
     type Item = Token;
+
+    /// Pull of the next regex match and convert it into a token.
     fn next(&mut self) -> Option<Token> {
-        self.iter.next().map(|t| token_from_str(&t[0]))
+        self.iter.next().map(|t| Token::from(&t[0]))
     }
 }
 
@@ -90,7 +89,6 @@ impl<'a> Iterator for Tokens<'a> {
 /// nix objects (as might be represented in a nix interpreter), as it
 /// does not represent functions and some other objects.
 #[derive(Debug, PartialEq, Serialize)]
-#[allow(dead_code)]
 pub enum Value {
     /// The singleton null value.
     Null,
@@ -128,30 +126,21 @@ pub enum Value {
     Map(HashMap<String, Value>),
 }
 
-// impl Serialize for Value {
-//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//         where S: Serializer
-//     {
-//         let mut map = serializer.serialize_map(Some(self.len()))?;
-//         for (k, v) in self {
-//             map.serialize_key(k)?;
-//             map.serialize_value(v)?;
-//         }
-//         map.end()
-//     }
-// }
-
-
+/// Represents the type of errors we might encounter when parsing
+/// nix-instantiate output.
 #[derive(Debug, PartialEq, Serialize)]
 pub enum ParseError {
+    /// When we're expecting some token (e.g. a closing curly brace or
+    /// square bracket) and the stream ends.
     UnexpectedEndOfInput,
+
+    /// When we are looking for a particular token and we encounter
+    /// this one instead.
     UnexpectedToken(Token),
-    UnterminatedList,
-    UnterminatedMap,
 }
 
-/// Parse a stream of nix output tokens into a nix value. Consumes one or more
-/// values from the stream.
+/// Parse a stream of nix output tokens into a nix value. Consumes one
+/// or more values from the stream.
 fn parse_value(tokens: &mut Tokens)
    -> Result<Value, ParseError> {
     use self::ParseError::*;
@@ -176,19 +165,11 @@ fn parse_list(tokens: &mut Tokens)
    -> Result<Value, ParseError> {
     let mut values = vec!();
     loop {
-        match tokens.peek() {
-            Some(Token::RBracket) => {
-                // Consume the bracket.
-                tokens.next();
-                // Exit the loop wrapping the vector in a list constructor.
-                return Ok(Value::List(values));
-            },
-            Some(_) => match parse_value(tokens) {
-                Ok(value) => values.push(value),
-                err => return err
-            },
-            _ => return Err(ParseError::UnterminatedList),
+        if let Some(Token::RBracket) = tokens.peek() {
+            tokens.next();
+            return Ok(Value::List(values))
         }
+        values.push(parse_value(tokens)?);
     }
 
 }
@@ -240,6 +221,8 @@ fn parse_nix_instantiate(output: &str) -> Result<Value, ParseError> {
     parse_value(&mut tokens)
 }
 
+
+/// Errors we anticipate when evaluating a nix expression.
 #[derive(Debug, PartialEq, Serialize)]
 pub enum InstantiationError {
     ParseError(ParseError),
@@ -365,15 +348,15 @@ fn test_nested_set() {
 #[test]
 fn test_token_from_str() {
     use self::Token::*;
-    assert!(token_from_str("null") == Null);
-    assert!(token_from_str("true") == Bool(true));
-    assert!(token_from_str("false") == Bool(false));
-    assert!(token_from_str("<CODE>") == CODE);
-    assert!(token_from_str("<LAMBDA>") == LAMBDA);
-    assert!(token_from_str("123") == Number(123));
-    assert!(token_from_str("-123") == Number(-123));
-    assert!(token_from_str("hello") == Ident("hello".to_string()));
-    assert!(token_from_str("\"quote me\"") == String("quote me".to_string()));
-    assert!(token_from_str(r#""I am a\nmore "complex" string.""#) ==
-             String("I am a\nmore \"complex\" string.".to_string()));
+    assert!(Token::from("null") == Null);
+    assert!(Token::from("true") == Bool(true));
+    assert!(Token::from("false") == Bool(false));
+    assert!(Token::from("<CODE>") == CODE);
+    assert!(Token::from("<LAMBDA>") == LAMBDA);
+    assert!(Token::from("123") == Number(123));
+    assert!(Token::from("-123") == Number(-123));
+    assert!(Token::from("hello") == Ident("hello".to_string()));
+    assert!(Token::from("\"quote me\"") == String("quote me".to_string()));
+    assert!(Token::from(r#""I am a\nmore "complex" string.""#) ==
+            String("I am a\nmore \"complex\" string.".to_string()));
 }
