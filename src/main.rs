@@ -1,41 +1,66 @@
-#[macro_use] extern crate lazy_static;
-extern crate regex;
+#[macro_use]
+extern crate lazy_static;
+#[macro_use]
+extern crate serde_derive;
 
+extern crate serde_json;
+extern crate regex;
+extern crate clap;
+
+use std::env::current_dir;
 use std::path::PathBuf;
+
+use clap::{App, Arg};
 use regex::Regex;
 
-pub mod build_deriv;
 pub mod parse_nix_instantiate;
-use parse_nix_instantiate::NIX_INSTANTIATE_OUTPUT_RE;
+use parse_nix_instantiate::exec_nix_instantiate;
 
-use build_deriv::eval_nix_attr;
+// const USAGE: &'static str = "
+// Evaluate a nix expression.
+
+// Usage:
+//   nix-eval
+// ";
 
 fn main() {
-    // let s: String = "farts".to_string();
-    // let s1: &str = &s[1..(s.len() - 1)];
-    // let s2: String = String::from(s1);
-    // println!("Hello, world {}!", s1);
-    let re = Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap();
-    let text = "2012-03-14, 2013-01-01 and 2014-07-05";
-    for cap in re.captures_iter(text) {
-        println!("Month: {} Day: {} Year: {}", &cap[2], &cap[3], &cap[1]);
-    }
-    let re = Regex::new(r"(?x)
-      (?P<y>\d{4}) # the year
-      -
-      (?P<m>\d{2}) # the month
-      -
-      (?P<d>\d{2}) # the day
-    ").unwrap();
-    let before = "2012-03-14, 2013-01-01 and 2014-07-05";
-    let after = re.replace_all(before, "$m/$d/$y");
-    assert_eq!(after, "03/14/2012, 01/01/2013 and 07/05/2014");
+    let cwd = current_dir().unwrap();
+    let matches = App::new("eval-nix")
+        .arg(Arg::with_name("PATH")
+             .default_value(cwd.to_str().unwrap()))
+        .arg(Arg::with_name("ATTRIBUTE"))
+        .arg(Arg::with_name("EXPR_ARGS")
+             .short("a")
+             .long("arg")
+             .number_of_values(2)
+             .multiple(true))
+        // .arg(Arg::from_usage("[ATTRIBUTE] -A, --attr 'Attribute in the file to eval'"))
+	.get_matches();
 
-    let text = r#"[2012 3 14 -123 {x = "hey \"yo\" sup"; zzz = true; y = <CODE>}]"#;
-    for cap in NIX_INSTANTIATE_OUTPUT_RE.captures_iter(text) {
-        println!("Cap: {}", &cap[0]);
+    let path = PathBuf::from(matches.value_of("PATH").unwrap());
+    let attribute = matches.value_of("ATTRIBUTE").map(String::from);
+    let mut expr_args = vec!();
+    // Iterate through pairs of expression arguments, turn them into a
+    // vector of tuples.
+    match matches.values_of("EXPR_ARGS") {
+        None => {},
+        Some(_args) => {
+            let mut o_key = None;
+            for item in _args {
+                match o_key {
+                    None => {
+                        o_key = Some(item);
+                    },
+                    Some(key) => {
+                        o_key = None;
+                        expr_args.push((String::from(key),
+                                        String::from(item)))
+                    },
+                }
+            }
+        },
     }
-
-    // let path = PathBuf::from("/home/anelson/test.nix");
-    // eval_nix_attr(&path, None);
+    let evald = exec_nix_instantiate(&path, attribute, &expr_args);
+    // println!("{:?}", evald);
+    println!("{}", serde_json::to_string(&evald).unwrap());
 }

@@ -1,5 +1,6 @@
 extern crate regex;
 extern crate unescape;
+extern crate serde;
 
 use std::collections::HashMap;
 use std::iter::{Peekable, FromIterator};
@@ -8,30 +9,40 @@ use std::process::Command;
 use std::slice;
 
 use regex::{Regex, CaptureMatches};
+//use serde::
+//use serde::ser; // Serialize; // , Serializer};
+
+// #[derive(Serialize, Deserialize, Debug)]
+// struct Point {
+//     x: i32,
+//     y: i32,
+// }
+
 
 lazy_static! {
 pub static ref NIX_INSTANTIATE_OUTPUT_RE: Regex = Regex::new(r#"(?x)
-  -?\d+                                 # Number
-  | [a-zA-Z][\w_\-']*                   # Identifier
-  | "(\\.|[^"])*"                       # String literal
-  | <CODE> | <LAMBDA> | <PRIMOP>        # Special indicators
-  | \[ | \] | \{ | \} | \( | \) | = | ; # Punctuation
+  -?\d+                                     # Number
+  | [a-zA-Z][\w_\-']*                       # Identifier
+  | "(\\.|[^"])*"                           # String literal
+  | /[^;]*                                  # Path literal
+  | <CODE> | <LAMBDA> | <PRIMOP> | <CYCLE>  # Special indicators
+  | \[ | \] | \{ | \} | \( | \) | = | ;     # Punctuation
 "#).unwrap();
 }
 
 /// When parsing the output of nix-instantiate, we'll tokenize into a
 /// vector of tokens; this type represents these.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 #[allow(dead_code)]
-enum Token {
-    Null, Bool(bool), String(String), CODE, LAMBDA, PRIMOP, Equals, Semi,
-    Number(i64), LParens, RParens, LBracket, RBracket, LCurly, RCurly,
-    Ident(String),
+pub enum Token {
+    Null, Bool(bool), String(String), CODE, LAMBDA, PRIMOP, CYCLE, Equals,
+    Semi, Number(i64), LParens, RParens, LBracket, RBracket, LCurly, RCurly,
+    Path(PathBuf), Ident(String),
 }
 
 fn token_from_str(token_str: &str) -> Token {
     lazy_static! {
-        static ref int_re: Regex = Regex::new(r"-?\d+").unwrap();
+        static ref int_re: Regex = Regex::new(r"^-?\d+$").unwrap();
     }
     use self::Token::*;
     match token_str {
@@ -39,6 +50,7 @@ fn token_from_str(token_str: &str) -> Token {
         "true" => Bool(true),
         "false" => Bool(false),
         "<CODE>" => CODE,
+        "<CYCLE>" => CYCLE,
         "<LAMBDA>" => LAMBDA,
         "<PRIMOP>" => PRIMOP,
         "(" => LParens, ")" => RParens,
@@ -49,6 +61,7 @@ fn token_from_str(token_str: &str) -> Token {
             // Trim off the quotes, unescape and panic if it fails
             String(unescape::unescape(&s[1..s.len() - 1]).unwrap()),
         s if int_re.is_match(s) => Number(s.parse().unwrap()),
+        s if s.starts_with("/") => Path(PathBuf::from(s)),
         _ => Ident(token_str.to_string()),
     }
 }
@@ -76,18 +89,19 @@ impl<'a> Iterator for Tokens<'a> {
 /// of nix-instantiate. This might be seen as a subset of all valid
 /// nix objects (as might be represented in a nix interpreter), as it
 /// does not represent functions and some other objects.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 #[allow(dead_code)]
 pub enum Value {
     /// The singleton null value.
     Null,
 
-    /// A function, which we do not inspect further.
+    /// A function, which we do not inspect further. This represents
+    /// both <LAMBDA> and <PRIMOP> tokens.
     Function,
 
     /// Code which is not yet evaluated; this is returned by nix to
     /// allow for circularity and avoiding compilation of large data
-    /// structures.
+    /// structures. This represents both <CODE> and <CYCLE> tokens.
     Unevaluated,
 
     /// A derivation, which can be viewed as a set but we represent
@@ -104,6 +118,9 @@ pub enum Value {
     /// Strings.
     String(String),
 
+    /// Paths.
+    Path(PathBuf),
+
     /// Lists of nix values.
     List(Vec<Value>),
 
@@ -111,8 +128,22 @@ pub enum Value {
     Map(HashMap<String, Value>),
 }
 
-#[derive(Debug, PartialEq)]
-enum ParseError {
+// impl Serialize for Value {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//         where S: Serializer
+//     {
+//         let mut map = serializer.serialize_map(Some(self.len()))?;
+//         for (k, v) in self {
+//             map.serialize_key(k)?;
+//             map.serialize_value(v)?;
+//         }
+//         map.end()
+//     }
+// }
+
+
+#[derive(Debug, PartialEq, Serialize)]
+pub enum ParseError {
     UnexpectedEndOfInput,
     UnexpectedToken(Token),
     UnterminatedList,
@@ -129,7 +160,9 @@ fn parse_value(tokens: &mut Tokens)
         Some(Token::Bool(b)) => Ok(Value::Bool(b)),
         Some(Token::Number(n)) => Ok(Value::Number(n)),
         Some(Token::String(s)) => Ok(Value::String(s)),
+        Some(Token::Path(p)) => Ok(Value::Path(p)),
         Some(Token::CODE) => Ok(Value::Unevaluated),
+        Some(Token::CYCLE) => Ok(Value::Unevaluated),
         Some(Token::LAMBDA) | Some(Token::PRIMOP) => Ok(Value::Function),
         Some(Token::LBracket) => parse_list(tokens),
         Some(Token::LCurly) => parse_set(tokens),
@@ -207,23 +240,46 @@ fn parse_nix_instantiate(output: &str) -> Result<Value, ParseError> {
     parse_value(&mut tokens)
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+pub enum InstantiationError {
+    ParseError(ParseError),
+    EvaluationError(String),
+    UnparsableEvaluationError,
+}
+
 /// Given a path to a nix file and a possible attribute off of that
 /// file, evaluate the attribute.
-fn exec_nix_instantiate(filepath: &PathBuf, attr: Option<String>)
-       -> Result<Value, ParseError> {
+pub fn exec_nix_instantiate(filepath: &PathBuf, attr: Option<String>,
+                            args: &Vec<(String, String)>)
+       -> Result<Value, InstantiationError> {
     let s = filepath.as_path().as_os_str();
     let mut cmd = Command::new("nix-instantiate");
     cmd.arg("--eval").arg(s);
     match attr {
         None => {},
-        Some(attr) => {cmd.arg(attr);}
+        Some(attr) => {cmd.args(&["-A", &attr]);}
     }
+    for &(ref arg_name, ref arg_val) in args {
+        println!("{}={}", arg_name, arg_val);
+        cmd.arg("--arg").arg(arg_name).arg(arg_val);
+    }
+    println!("{:?}", cmd);
     let output = cmd.output().expect("failed to start nix-instantiate");
-    let lines = String::from_utf8_lossy(&output.stdout);
-    println!("Got lines:\n{}", lines);
-    unimplemented!();
-// filepath.as_os_str());
-//                      .args(&["-A", attr.as_slice()]);
+    use self::InstantiationError::*;
+    if output.status.success() {
+        let output_string = String::from_utf8_lossy(&output.stdout);
+        match parse_nix_instantiate(&output_string) {
+            Ok(value) => Ok(value),
+            Err(p_error) => Err(ParseError(p_error)),
+        }
+    } else {
+        match String::from_utf8(output.stderr) {
+            Err(_) => Err(UnparsableEvaluationError),
+            Ok(unicode) => Err(EvaluationError(unicode))
+        }
+      //  let err_string = String::from_utf8(output.stderr).unwrap().trim();
+      //  Err(EvaluationError(String::from(err_string)))
+    }
 }
 
 
@@ -234,6 +290,7 @@ fn test_parse_literals() {
     assert!(parse_nix_instantiate("true") == Ok(Bool(true)));
     assert!(parse_nix_instantiate("false") == Ok(Bool(false)));
     assert!(parse_nix_instantiate("<CODE>") == Ok(Unevaluated));
+    assert!(parse_nix_instantiate("<CYCLE>") == Ok(Unevaluated));
     assert!(parse_nix_instantiate("<LAMBDA>") == Ok(Function));
     assert!(parse_nix_instantiate("<PRIMOP>") == Ok(Function));
 }
